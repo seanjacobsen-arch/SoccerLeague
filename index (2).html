@@ -1,0 +1,1086 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Pick Your Club — Group Soccer Recommender</title>
+
+<!-- React + Babel, no build step needed -->
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js" crossorigin></script>
+<script src="https://cdn.tailwindcss.com"></script>
+
+<!-- Firebase (compat build — simplest, no bundler required) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Teko:wght@500;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+  body { font-family: 'Inter', sans-serif; margin: 0; }
+  .tactics-slider { -webkit-appearance: none; height: 4px; border-radius: 2px; background: #2C463A; outline: none; }
+  .tactics-slider::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #C7A046; cursor: pointer; border: 2px solid #0B3D2E; }
+  .tactics-slider::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #C7A046; cursor: pointer; border: 2px solid #0B3D2E; }
+  .tactics-select { background: #0F2E24; color: #F3EFE4; border: 1px solid #2C463A; border-radius: 6px; padding: 6px 8px; font-size: 13px; width: 100%; }
+  .tactics-select:focus { outline: 1px solid #C7A046; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useMemo, useCallback } = React;
+
+/* =========================================================================
+   FIREBASE SETUP
+   -------------------------------------------------------------------------
+   1. Go to console.firebase.google.com → create a project (free tier is
+      plenty for 4 people).
+   2. Build a Web app inside that project, copy the config object it gives
+      you, and paste it in place of the placeholder below.
+   3. Create a Firestore database (test mode is fine to start — Firestore
+      config values are meant to be public client-side; access control
+      happens via Firestore Security Rules, not by hiding this object).
+   4. In Firestore Rules, something like this is enough for a private
+      4-person group app:
+        rules_version = '2';
+        service cloud.firestore {
+          match /databases/{database}/documents {
+            match /picks/{friendId} {
+              allow read, write: if true; // fine for a small private link
+            }
+          }
+        }
+   ========================================================================= */
+const firebaseConfig = {
+  apiKey: "PASTE_YOUR_API_KEY",
+  authDomain: "PASTE_YOUR_PROJECT.firebaseapp.com",
+  projectId: "PASTE_YOUR_PROJECT_ID",
+  storageBucket: "PASTE_YOUR_PROJECT.appspot.com",
+  messagingSenderId: "PASTE_YOUR_SENDER_ID",
+  appId: "PASTE_YOUR_APP_ID",
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+
+async function storageGet(key) {
+  const doc = await db.collection("picks").doc(key).get();
+  return doc.exists ? { value: JSON.stringify(doc.data()) } : null;
+}
+async function storageSet(key, valueObj) {
+  await db.collection("picks").doc(key).set(valueObj);
+  return true;
+}
+
+/* =========================================================================
+   LAYER 1 — data (source of truth)
+   ========================================================================= */
+
+const LEAGUE_META = {
+  epl: { name: "Premier League", streaming: ["Peacock"], typicalKickoffET: 9.5, competitiveBalance: 7,
+    continentalPrestige: 9, relegationDrama: 9, usmntConcentration: 6 },
+  bundesliga: { name: "Bundesliga", streaming: ["ESPN+"], typicalKickoffET: 10.0, competitiveBalance: 3,
+    continentalPrestige: 7, relegationDrama: 7, usmntConcentration: 8 },
+  seriea: { name: "Serie A", streaming: ["Paramount+"], typicalKickoffET: 10.5, competitiveBalance: 6,
+    continentalPrestige: 7, relegationDrama: 8, usmntConcentration: 6 },
+  laliga: { name: "La Liga", streaming: ["ESPN+"], typicalKickoffET: 10.5, competitiveBalance: 5,
+    continentalPrestige: 9, relegationDrama: 6, usmntConcentration: 3 },
+  ligue1: { name: "Ligue 1", streaming: ["Apple TV"], typicalKickoffET: 11.5, competitiveBalance: 3,
+    continentalPrestige: 6, relegationDrama: 6, usmntConcentration: 3 },
+};
+
+// The 8 "Debate & Alignment" dimensions. Each is a single 1-5 slider per
+// person: the position IS the priority -- a 1 or 5 is a strongly-held stance,
+// a 3 is neutral/low-priority. Group consensus is the average; group
+// disagreement (stdev) is what triggers a "Group Tension Point."
+const DEBATE_DIMENSIONS = [
+  { key: "goalDensity", label: "Goal Density Tolerance", left: "Tactical, low-scoring", right: "High-variance, high-scoring" },
+  { key: "narrativeFocus", label: "Narrative Focus", left: "Technical quality", right: "Storylines & upsets" },
+  { key: "clPrestige", label: "Continental Glory", left: "Domestic title focus", right: "Champions League presence" },
+  { key: "relegationDrama", label: "Relegation Drama", left: "Don't care about the drop", right: "Love the fight to survive" },
+  { key: "usmntExposure", label: "USMNT Exposure", left: "Doesn't matter", right: "Want lots of US players" },
+  { key: "antiDominance", label: "Anti-Dominance", left: "Dynasties are fine", right: "Hate one team winning every year" },
+  { key: "stadiumAtmosphere", label: "Stadium Atmosphere", left: "Don't care about atmosphere", right: "Atmosphere is everything" },
+  { key: "learningCurve", label: "Learning Curve", left: "Known stars, easy to follow", right: "Discovery league, new names" },
+];
+
+const CLUB_DATA = [
+  // ===== Premier League (20) — full confirmed 2026-27 roster =====
+  { id: "arsenal", name: "Arsenal", leagueId: "epl", color: "#EF0107", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "North London Derby", intensity: 8 }, nations: ["England", "Brazil", "Ukraine"], underdogScore: 4,
+    playstyle: { pace: 7, aggression: 7, technicality: 8, discipline: 7 } },
+  { id: "astonvilla", name: "Aston Villa", leagueId: "epl", color: "#670E36", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Second City Derby", intensity: 6 }, nations: ["England", "Argentina", "Netherlands"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "bournemouth", name: "Bournemouth", leagueId: "epl", color: "#DA291C", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "South Coast Derby", intensity: 5 }, nations: ["England", "Ghana", "Nigeria"], underdogScore: 7,
+    playstyle: { pace: 7, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "brentford", name: "Brentford", leagueId: "epl", color: "#E30613", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "West London Derby", intensity: 5 }, nations: ["England", "Denmark", "Argentina"], underdogScore: 7,
+    playstyle: { pace: 7, aggression: 7, technicality: 6, discipline: 6 } },
+  { id: "brighton", name: "Brighton & Hove Albion", leagueId: "epl", color: "#0057B8", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "M23 Derby (vs. Crystal Palace)", intensity: 7 }, nations: ["England", "Argentina", "Japan"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 7 } },
+  { id: "chelsea", name: "Chelsea", leagueId: "epl", color: "#034694", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "London Rivalry (vs. Tottenham)", intensity: 8 }, nations: ["England", "Ecuador", "France"], underdogScore: 3,
+    playstyle: { pace: 7, aggression: 7, technicality: 8, discipline: 7 } },
+  { id: "coventry", name: "Coventry City", leagueId: "epl", color: "#78D0F2", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Midlands Rivalry", intensity: 5 }, nations: ["England"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "crystalpalace", name: "Crystal Palace", leagueId: "epl", color: "#1B458F", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "M23 Derby (vs. Brighton)", intensity: 7 }, nations: ["England", "France", "Netherlands"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 6 } },
+  { id: "everton", name: "Everton", leagueId: "epl", color: "#003399", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Merseyside Derby", intensity: 9 }, nations: ["England", "Brazil", "Netherlands"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 7, technicality: 6, discipline: 6 } },
+  { id: "fulham", name: "Fulham", leagueId: "epl", color: "#000000", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "West London Derby (vs. Chelsea)", intensity: 6 }, nations: ["England", "Portugal", "Serbia"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 5, technicality: 7, discipline: 6 } },
+  { id: "hullcity", name: "Hull City", leagueId: "epl", color: "#F5A623", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Yorkshire Rivalry (vs. Leeds)", intensity: 6 }, nations: ["England"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "ipswich", name: "Ipswich Town", leagueId: "epl", color: "#0044A9", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Old Farm Derby (vs. Norwich)", intensity: 5 }, nations: ["England"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 5, technicality: 5, discipline: 5 } },
+  { id: "leeds", name: "Leeds United", leagueId: "epl", color: "#1D428A", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Yorkshire Rivalry / vs. Man United", intensity: 7 }, nations: ["England", "Argentina", "Brazil"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 7, technicality: 6, discipline: 5 } },
+  { id: "liverpool", name: "Liverpool", leagueId: "epl", color: "#C8102E", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Merseyside Derby / vs. Man United", intensity: 9 }, nations: ["England", "Netherlands", "Egypt"], underdogScore: 3,
+    playstyle: { pace: 9, aggression: 8, technicality: 7, discipline: 6 } },
+  { id: "mancity", name: "Manchester City", leagueId: "epl", color: "#6CABDD", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Manchester Derby", intensity: 8 }, nations: ["England", "Netherlands", "Brazil"], underdogScore: 2,
+    playstyle: { pace: 6, aggression: 5, technicality: 9, discipline: 9 } },
+  { id: "manutd", name: "Manchester United", leagueId: "epl", color: "#DA020E", tacticalDNA: "Transitional/Star-Driven",
+    rivalry: { name: "Manchester Derby", intensity: 8 }, nations: ["England", "Portugal", "Netherlands"], underdogScore: 4,
+    playstyle: { pace: 7, aggression: 7, technicality: 6, discipline: 5 } },
+  { id: "newcastle", name: "Newcastle United", leagueId: "epl", color: "#241F20", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Tyne–Wear Derby", intensity: 8 }, nations: ["England", "Sweden", "Brazil"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 7 } },
+  { id: "nottmforest", name: "Nottingham Forest", leagueId: "epl", color: "#DD0000", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "East Midlands Derby", intensity: 7 }, nations: ["England", "Serbia", "Switzerland"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 7, technicality: 6, discipline: 6 } },
+  { id: "sunderland", name: "Sunderland", leagueId: "epl", color: "#EB172B", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Tyne–Wear Derby", intensity: 8 }, nations: ["England"], underdogScore: 7,
+    playstyle: { pace: 7, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "tottenham", name: "Tottenham Hotspur", leagueId: "epl", color: "#132257", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "North London Derby", intensity: 8 }, nations: ["England", "South Korea", "Argentina"], underdogScore: 4,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+
+  // ===== Bundesliga (18) — full confirmed 2026-27 roster =====
+  { id: "augsburg", name: "FC Augsburg", leagueId: "bundesliga", color: "#BA3733", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "vs. Bayern (David & Goliath)", intensity: 4 }, nations: ["Germany"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 6 } },
+  { id: "unionberlin", name: "1. FC Union Berlin", leagueId: "bundesliga", color: "#EB1923", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Berlin Derby (vs. Hertha)", intensity: 6 }, nations: ["Germany"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 7, technicality: 5, discipline: 6 } },
+  { id: "werderbremen", name: "Werder Bremen", leagueId: "bundesliga", color: "#1D9053", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Nordderby (vs. Hamburger SV)", intensity: 7 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "dortmund", name: "Borussia Dortmund", leagueId: "bundesliga", color: "#FDE100", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Der Klassiker", intensity: 8 }, nations: ["Germany", "Belgium", "Netherlands"], underdogScore: 5,
+    playstyle: { pace: 9, aggression: 8, technicality: 7, discipline: 6 } },
+  { id: "frankfurt", name: "Eintracht Frankfurt", leagueId: "bundesliga", color: "#E1000F", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Hessen Rivalry (vs. Mainz)", intensity: 6 }, nations: ["Germany", "Ghana", "Colombia"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 6 } },
+  { id: "freiburg", name: "SC Freiburg", leagueId: "bundesliga", color: "#EC1C24", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Baden Derby", intensity: 5 }, nations: ["Germany"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 5, technicality: 6, discipline: 7 } },
+  { id: "hamburgersv", name: "Hamburger SV", leagueId: "bundesliga", color: "#0F3282", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Nordderby (vs. Werder Bremen)", intensity: 7 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "hoffenheim", name: "TSG Hoffenheim", leagueId: "bundesliga", color: "#1961B5", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "\"Plastic Club\" Resentment", intensity: 4 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "koln", name: "1. FC Köln", leagueId: "bundesliga", color: "#ED1C24", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Rhine Derby", intensity: 7 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 5 } },
+  { id: "leipzig", name: "RB Leipzig", leagueId: "bundesliga", color: "#DD0741", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "vs. Bayern (Establishment Rivalry)", intensity: 6 }, nations: ["Germany", "Hungary", "France"], underdogScore: 7,
+    playstyle: { pace: 8, aggression: 7, technicality: 7, discipline: 7 } },
+  { id: "leverkusen", name: "Bayer Leverkusen", leagueId: "bundesliga", color: "#E32221", tacticalDNA: "Disciplined Pressing",
+    rivalry: { name: "Rhine Derby", intensity: 6 }, nations: ["Germany", "Netherlands", "Spain"], underdogScore: 6,
+    playstyle: { pace: 8, aggression: 7, technicality: 8, discipline: 8 } },
+  { id: "mainz", name: "Mainz 05", leagueId: "bundesliga", color: "#C3141E", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Hessen Rivalry (vs. Frankfurt)", intensity: 5 }, nations: ["Germany"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "gladbach", name: "Borussia Mönchengladbach", leagueId: "bundesliga", color: "#1A9F5A", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Rhine Derby (vs. Köln)", intensity: 7 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "bayern", name: "Bayern Munich", leagueId: "bundesliga", color: "#DC052D", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Der Klassiker", intensity: 8 }, nations: ["Germany", "England", "France"], underdogScore: 2,
+    playstyle: { pace: 6, aggression: 6, technicality: 9, discipline: 9 } },
+  { id: "stuttgart", name: "VfB Stuttgart", leagueId: "bundesliga", color: "#E32219", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "vs. Karlsruhe", intensity: 5 }, nations: ["Germany"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "elversberg", name: "SV Elversberg", leagueId: "bundesliga", color: "#003366", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Saarland Pride", intensity: 3 }, nations: ["Germany"], underdogScore: 9,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "schalke", name: "Schalke 04", leagueId: "bundesliga", color: "#004D9D", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Revierderby (vs. Dortmund)", intensity: 8 }, nations: ["Germany"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 7, technicality: 5, discipline: 5 } },
+  { id: "paderborn", name: "SC Paderborn", leagueId: "bundesliga", color: "#003399", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Regional Pride", intensity: 3 }, nations: ["Germany"], underdogScore: 9,
+    playstyle: { pace: 7, aggression: 6, technicality: 5, discipline: 5 } },
+
+  // ===== Serie A (20) — full confirmed 2026-27 roster =====
+  { id: "atalanta", name: "Atalanta", leagueId: "seriea", color: "#1E71B8", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Bergamo Pride (vs. Brescia)", intensity: 6 }, nations: ["Italy", "Netherlands", "Colombia"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 6 } },
+  { id: "bologna", name: "Bologna", leagueId: "seriea", color: "#A61E22", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Apennine Derby (vs. Fiorentina)", intensity: 6 }, nations: ["Italy", "Nigeria", "Netherlands"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "cagliari", name: "Cagliari", leagueId: "seriea", color: "#9E1B32", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Sardinian Pride", intensity: 3 }, nations: ["Italy"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 6 } },
+  { id: "como", name: "Como", leagueId: "seriea", color: "#003DA5", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Lake Como Pride", intensity: 3 }, nations: ["Italy", "Argentina", "Netherlands"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 5, technicality: 8, discipline: 6 } },
+  { id: "cremonese", name: "Cremonese", leagueId: "seriea", color: "#A6192E", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby della Lombardia (vs. Brescia)", intensity: 5 }, nations: ["Italy"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 6 } },
+  { id: "fiorentina", name: "Fiorentina", leagueId: "seriea", color: "#663399", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "vs. Juventus", intensity: 7 }, nations: ["Italy", "Argentina", "Albania"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "genoa", name: "Genoa", leagueId: "seriea", color: "#C1121C", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby della Lanterna (vs. Sampdoria)", intensity: 8 }, nations: ["Italy", "Mexico", "Paraguay"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 7, technicality: 6, discipline: 6 } },
+  { id: "inter", name: "Inter Milan", leagueId: "seriea", color: "#003D7C", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby della Madonnina", intensity: 9 }, nations: ["Argentina", "Italy", "Netherlands"], underdogScore: 4,
+    playstyle: { pace: 6, aggression: 7, technicality: 8, discipline: 8 } },
+  { id: "juventus", name: "Juventus", leagueId: "seriea", color: "#000000", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby d'Italia", intensity: 9 }, nations: ["Italy", "Serbia", "USA"], underdogScore: 3,
+    playstyle: { pace: 5, aggression: 6, technicality: 8, discipline: 9 } },
+  { id: "lazio", name: "Lazio", leagueId: "seriea", color: "#87D8F7", tacticalDNA: "Disciplined Pressing",
+    rivalry: { name: "Derby della Capitale (vs. Roma)", intensity: 10 }, nations: ["Italy", "Serbia", "Bosnia and Herzegovina"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 7, technicality: 7, discipline: 7 } },
+  { id: "acmilan", name: "AC Milan", leagueId: "seriea", color: "#FB090B", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby della Madonnina", intensity: 9 }, nations: ["Portugal", "France", "Italy"], underdogScore: 4,
+    playstyle: { pace: 7, aggression: 7, technicality: 8, discipline: 7 } },
+  { id: "napoli", name: "Napoli", leagueId: "seriea", color: "#12A0D7", tacticalDNA: "Counter-Attacking Flair",
+    rivalry: { name: "vs. Juventus (North–South Rivalry)", intensity: 7 }, nations: ["Georgia", "Italy", "Nigeria"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 9, discipline: 6 } },
+  { id: "parma", name: "Parma", leagueId: "seriea", color: "#003D7C", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Emilia Rivalry (vs. Reggiana)", intensity: 4 }, nations: ["Italy", "Colombia", "Poland"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "roma", name: "Roma", leagueId: "seriea", color: "#8E1F2F", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Derby della Capitale (vs. Lazio)", intensity: 10 }, nations: ["Italy", "Argentina", "Ghana"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "sassuolo", name: "Sassuolo", leagueId: "seriea", color: "#00A650", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Emilia Rivalry", intensity: 3 }, nations: ["Italy"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 5, technicality: 7, discipline: 6 } },
+  { id: "torino", name: "Torino", leagueId: "seriea", color: "#7B1E3A", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derby della Mole (vs. Juventus)", intensity: 9 }, nations: ["Italy", "Colombia"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 7, technicality: 6, discipline: 6 } },
+  { id: "udinese", name: "Udinese", leagueId: "seriea", color: "#FE5000", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Friuli Pride", intensity: 4 }, nations: ["Italy", "Sweden", "Brazil"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "venezia", name: "Venezia", leagueId: "seriea", color: "#FF7900", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Veneto Derby (vs. Padova)", intensity: 5 }, nations: ["Italy"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "frosinone", name: "Frosinone", leagueId: "seriea", color: "#FFCC00", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Ciociaria Pride", intensity: 3 }, nations: ["Italy"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "monza", name: "Monza", leagueId: "seriea", color: "#D40000", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Lombardy Rivalry (vs. Como)", intensity: 4 }, nations: ["Italy"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+
+  // ===== La Liga (20) — full confirmed 2026-27 roster =====
+  { id: "alaves", name: "Alavés", leagueId: "laliga", color: "#0047AB", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Basque Pride", intensity: 4 }, nations: ["Spain"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 6 } },
+  { id: "athleticbilbao", name: "Athletic Bilbao", leagueId: "laliga", color: "#EE2523", tacticalDNA: "Regional Identity / Basque-Only Roster",
+    rivalry: { name: "Basque Derby (vs. Real Sociedad)", intensity: 7 }, nations: ["Spain"], underdogScore: 7,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 6 } },
+  { id: "atletico", name: "Atlético Madrid", leagueId: "laliga", color: "#CB3524", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Madrid Derby", intensity: 8 }, nations: ["Spain", "Argentina", "France"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 8, technicality: 6, discipline: 9 } },
+  { id: "barcelona", name: "Barcelona", leagueId: "laliga", color: "#A50044", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "El Clásico", intensity: 10 }, nations: ["Spain", "Poland", "Brazil"], underdogScore: 2,
+    playstyle: { pace: 7, aggression: 5, technicality: 10, discipline: 8 } },
+  { id: "celtavigo", name: "Celta Vigo", leagueId: "laliga", color: "#8AC3EE", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Galician Derby (vs. Deportivo)", intensity: 8 }, nations: ["Spain", "Argentina", "Sweden"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "elche", name: "Elche", leagueId: "laliga", color: "#00843D", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Valencia Region Rivalry", intensity: 4 }, nations: ["Spain"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 5 } },
+  { id: "espanyol", name: "Espanyol", leagueId: "laliga", color: "#0A4C99", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Derbi Barceloní (vs. Barcelona)", intensity: 7 }, nations: ["Spain", "Argentina"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "getafe", name: "Getafe", leagueId: "laliga", color: "#005CA9", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Madrid Minnow Rivalry (vs. Real Madrid)", intensity: 4 }, nations: ["Spain"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 7, technicality: 5, discipline: 7 } },
+  { id: "levante", name: "Levante", leagueId: "laliga", color: "#B4122D", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Valencia Derby", intensity: 7 }, nations: ["Spain"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 5 } },
+  { id: "osasuna", name: "Osasuna", leagueId: "laliga", color: "#D91A21", tacticalDNA: "Disciplined Pressing",
+    rivalry: { name: "Navarre Pride", intensity: 5 }, nations: ["Spain"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 7, technicality: 6, discipline: 7 } },
+  { id: "rayovallecano", name: "Rayo Vallecano", leagueId: "laliga", color: "#E32119", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Madrid Derby (minor)", intensity: 5 }, nations: ["Spain"], underdogScore: 7,
+    playstyle: { pace: 7, aggression: 7, technicality: 6, discipline: 5 } },
+  { id: "realbetis", name: "Real Betis", leagueId: "laliga", color: "#0BB363", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Seville Derby (vs. Sevilla)", intensity: 9 }, nations: ["Spain", "Mexico", "Côte d'Ivoire"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 6, technicality: 8, discipline: 6 } },
+  { id: "realmadrid", name: "Real Madrid", leagueId: "laliga", color: "#FEBE10", tacticalDNA: "Star-Driven Counter",
+    rivalry: { name: "El Clásico", intensity: 10 }, nations: ["France", "Brazil", "England"], underdogScore: 1,
+    playstyle: { pace: 8, aggression: 6, technicality: 9, discipline: 7 } },
+  { id: "realsociedad", name: "Real Sociedad", leagueId: "laliga", color: "#0067B1", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Basque Derby (vs. Athletic Bilbao)", intensity: 8 }, nations: ["Spain", "Japan", "Norway"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 5, technicality: 8, discipline: 7 } },
+  { id: "sevilla", name: "Sevilla", leagueId: "laliga", color: "#D40027", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Seville Derby (vs. Real Betis)", intensity: 9 }, nations: ["Spain", "Argentina", "Netherlands"], underdogScore: 5,
+    playstyle: { pace: 6, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "valencia", name: "Valencia", leagueId: "laliga", color: "#FF7300", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Comunitat Valenciana Derby (vs. Villarreal)", intensity: 6 }, nations: ["Spain"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "villarreal", name: "Villarreal", leagueId: "laliga", color: "#F2C500", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Comunitat Valenciana Derby (vs. Valencia)", intensity: 6 }, nations: ["Spain", "France", "Argentina"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 5, technicality: 8, discipline: 7 } },
+  { id: "racingsantander", name: "Racing Santander", leagueId: "laliga", color: "#04A94A", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Cantabrian Pride (vs. Sporting Gijón)", intensity: 4 }, nations: ["Spain"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "depla-coruna", name: "Deportivo La Coruña", leagueId: "laliga", color: "#005BAC", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Galician Derby (vs. Celta Vigo)", intensity: 8 }, nations: ["Spain"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "malaga", name: "Málaga", leagueId: "laliga", color: "#1966A6", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Andalusian Pride (vs. Sevilla)", intensity: 4 }, nations: ["Spain"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+
+  // ===== Ligue 1 (18) — full confirmed 2026-27 roster =====
+  { id: "angers", name: "Angers", leagueId: "ligue1", color: "#1B1B1B", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Pays de la Loire Pride", intensity: 3 }, nations: ["France"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "auxerre", name: "Auxerre", leagueId: "ligue1", color: "#1E3A8A", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Burgundy Pride", intensity: 3 }, nations: ["France"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "brest", name: "Brest", leagueId: "ligue1", color: "#E2001A", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Breton Rivalry (vs. Rennes/Lorient)", intensity: 5 }, nations: ["France"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "lehavre", name: "Le Havre", leagueId: "ligue1", color: "#1E90FF", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Normandy Pride", intensity: 4 }, nations: ["France"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 6 } },
+  { id: "lens", name: "RC Lens", leagueId: "ligue1", color: "#C8102E", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Derby du Nord (vs. Lille)", intensity: 9 }, nations: ["France", "Senegal", "Poland"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 7, technicality: 7, discipline: 7 } },
+  { id: "lille", name: "Lille", leagueId: "ligue1", color: "#C41E3A", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Derby du Nord (vs. Lens)", intensity: 9 }, nations: ["France", "Portugal", "Canada"], underdogScore: 5,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 7 } },
+  { id: "lorient", name: "Lorient", leagueId: "ligue1", color: "#FF6600", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Breton Derby (vs. Rennes/Brest)", intensity: 5 }, nations: ["France"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 5 } },
+  { id: "lyon", name: "Olympique Lyonnais", leagueId: "ligue1", color: "#DA0016", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Derby Rhône-Alpes (vs. Saint-Étienne)", intensity: 8 }, nations: ["France", "Netherlands", "Argentina"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "marseille", name: "Olympique de Marseille", leagueId: "ligue1", color: "#2FAEE0", tacticalDNA: "High-Transition/Pressing",
+    rivalry: { name: "Le Classique", intensity: 9 }, nations: ["France", "Algeria", "Cameroon"], underdogScore: 5,
+    playstyle: { pace: 8, aggression: 8, technicality: 7, discipline: 5 } },
+  { id: "monaco", name: "AS Monaco", leagueId: "ligue1", color: "#E51A23", tacticalDNA: "Counter-Attacking Flair",
+    rivalry: { name: "Côte d'Azur Derby (vs. Nice)", intensity: 6 }, nations: ["France", "Belgium", "Netherlands"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 8, discipline: 7 } },
+  { id: "nice", name: "OGC Nice", leagueId: "ligue1", color: "#E2001A", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Côte d'Azur Derby (vs. Monaco)", intensity: 6 }, nations: ["France"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "parisfc", name: "Paris FC", leagueId: "ligue1", color: "#6CACE4", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Derby Parisien (vs. PSG)", intensity: 6 }, nations: ["France"], underdogScore: 7,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "psg", name: "Paris Saint-Germain", leagueId: "ligue1", color: "#004170", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Le Classique", intensity: 9 }, nations: ["France", "Morocco", "Portugal"], underdogScore: 2,
+    playstyle: { pace: 7, aggression: 6, technicality: 9, discipline: 7 } },
+  { id: "rennes", name: "Rennes", leagueId: "ligue1", color: "#E2001A", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Breton Derby (vs. Lorient/Nantes)", intensity: 5 }, nations: ["France"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "strasbourg", name: "Strasbourg", leagueId: "ligue1", color: "#1B2A5B", tacticalDNA: "Positional/Territorial Control",
+    rivalry: { name: "Alsace Pride", intensity: 4 }, nations: ["France", "Netherlands"], underdogScore: 6,
+    playstyle: { pace: 7, aggression: 6, technicality: 7, discipline: 6 } },
+  { id: "toulouse", name: "Toulouse", leagueId: "ligue1", color: "#6A0DAD", tacticalDNA: "Pressing/Possession Hybrid",
+    rivalry: { name: "Occitanie Rivalry (vs. Montpellier)", intensity: 4 }, nations: ["France"], underdogScore: 6,
+    playstyle: { pace: 6, aggression: 6, technicality: 6, discipline: 6 } },
+  { id: "troyes", name: "Troyes", leagueId: "ligue1", color: "#0055A4", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Champagne Region Pride", intensity: 3 }, nations: ["France"], underdogScore: 8,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+  { id: "lemans", name: "Le Mans", leagueId: "ligue1", color: "#FFD700", tacticalDNA: "Tactical/Defensive",
+    rivalry: { name: "Sarthe Pride", intensity: 3 }, nations: ["France"], underdogScore: 9,
+    playstyle: { pace: 6, aggression: 6, technicality: 5, discipline: 5 } },
+];
+
+const STREAMING_SERVICES = ["Peacock", "ESPN+", "Paramount+", "Apple TV"];
+
+const KICKOFF_OPTIONS = [
+  { value: "7:00", hour: 7 }, { value: "7:30", hour: 7.5 }, { value: "8:00", hour: 8 },
+  { value: "8:30", hour: 8.5 }, { value: "9:00", hour: 9 }, { value: "9:30", hour: 9.5 },
+  { value: "10:00", hour: 10 }, { value: "10:30", hour: 10.5 }, { value: "11:00", hour: 11 },
+  { value: "11:30", hour: 11.5 }, { value: "12:00", hour: 12 },
+  { value: "no-limit", hour: -1, label: "No limit — I'll DVR it" },
+];
+
+const NATION_GROUPS = [
+  { label: "Hosts", teams: [{ nation: "Canada", style: "control" }, { nation: "Mexico", style: "chaos" }, { nation: "USA", style: "chaos" }] },
+  { label: "AFC", teams: [
+    { nation: "Australia", style: "chaos" }, { nation: "Iraq", style: "chaos" }, { nation: "IR Iran", style: "control" },
+    { nation: "Japan", style: "control" }, { nation: "Jordan", style: "chaos" }, { nation: "Korea Republic", style: "chaos" },
+    { nation: "Qatar", style: "control" }, { nation: "Saudi Arabia", style: "control" }, { nation: "Uzbekistan", style: "control" },
+  ]},
+  { label: "CAF", teams: [
+    { nation: "Algeria", style: "chaos" }, { nation: "Cabo Verde", style: "chaos" }, { nation: "Congo DR", style: "chaos" },
+    { nation: "Côte d'Ivoire", style: "chaos" }, { nation: "Egypt", style: "control" }, { nation: "Ghana", style: "chaos" },
+    { nation: "Morocco", style: "chaos" }, { nation: "Senegal", style: "chaos" }, { nation: "South Africa", style: "control" },
+    { nation: "Tunisia", style: "control" },
+  ]},
+  { label: "Concacaf", teams: [{ nation: "Curaçao", style: "chaos" }, { nation: "Haiti", style: "chaos" }, { nation: "Panama", style: "control" }] },
+  { label: "CONMEBOL", teams: [
+    { nation: "Argentina", style: "control" }, { nation: "Brazil", style: "chaos" }, { nation: "Colombia", style: "chaos" },
+    { nation: "Ecuador", style: "control" }, { nation: "Paraguay", style: "control" }, { nation: "Uruguay", style: "control" },
+  ]},
+  { label: "OFC", teams: [{ nation: "New Zealand", style: "chaos" }] },
+  { label: "UEFA", teams: [
+    { nation: "Austria", style: "control" }, { nation: "Belgium", style: "control" }, { nation: "Bosnia and Herzegovina", style: "chaos" },
+    { nation: "Croatia", style: "control" }, { nation: "Czechia", style: "control" }, { nation: "England", style: "chaos" },
+    { nation: "France", style: "chaos" }, { nation: "Germany", style: "control" }, { nation: "Netherlands", style: "control" },
+    { nation: "Norway", style: "chaos" }, { nation: "Portugal", style: "chaos" }, { nation: "Scotland", style: "chaos" },
+    { nation: "Spain", style: "control" }, { nation: "Sweden", style: "control" }, { nation: "Switzerland", style: "control" },
+    { nation: "Türkiye", style: "chaos" },
+  ]},
+];
+const ALL_NATIONS = NATION_GROUPS.flatMap((g) => g.teams);
+
+const CREDENTIALS = { josh: "tool", matt: "hemp", kevin: "quaker", sean: "asshole" };
+const FRIEND_META = {
+  josh: { name: "Josh", number: 7 }, matt: { name: "Matt", number: 10 },
+  kevin: { name: "Kevin", number: 4 }, sean: { name: "Sean", number: 1 },
+};
+const FRIEND_IDS = Object.keys(FRIEND_META);
+
+const DEFAULT_RECORD = () => ({
+  streaming: { Peacock: false, "ESPN+": false, "Paramount+": false, "Apple TV": false },
+  tactical: "Argentina", enjoyable: "Brazil",
+  control: 5, star: 5,
+  earliestET: "no-limit",
+  dynastyDrama: 5, underdogAffinity: 5,
+  loveClub: "none", hateClub: "none",
+  debate: {
+    goalDensity: 3, narrativeFocus: 3, clPrestige: 3, relegationDrama: 3,
+    usmntExposure: 3, antiDominance: 3, stadiumAtmosphere: 3, learningCurve: 3,
+  },
+  submitted: false,
+});
+
+/* =========================================================================
+   LAYER 2 — recommender logic (identical to the Claude-artifact version)
+   ========================================================================= */
+
+function projectClubVibe(club) {
+  const { pace, technicality, discipline } = club.playstyle;
+  return { control: (discipline + (10 - pace)) / 2, star: (technicality + (10 - discipline)) / 2 };
+}
+function avg(records, key) {
+  const list = Object.values(records);
+  return list.reduce((s, r) => s + r[key], 0) / list.length;
+}
+function groupVibe(records) { return { control: avg(records, "control"), star: avg(records, "star") }; }
+
+function accessMultiplier(club, records) {
+  const league = LEAGUE_META[club.leagueId];
+  const list = Object.values(records);
+  const covered = list.filter((r) => league.streaming.some((svc) => r.streaming[svc])).length;
+  return { multiplier: Math.max(0.25, covered / list.length), covered, total: list.length, league };
+}
+
+function timeMultiplier(club, records) {
+  const league = LEAGUE_META[club.leagueId];
+  const list = Object.values(records);
+  const covered = list.filter((r) => {
+    const opt = KICKOFF_OPTIONS.find((o) => o.value === r.earliestET);
+    return !opt || opt.hour === -1 || league.typicalKickoffET >= opt.hour;
+  }).length;
+  return { multiplier: Math.max(0.25, covered / list.length), covered, total: list.length, typicalET: league.typicalKickoffET };
+}
+
+function loyaltyMultiplier(club, records) {
+  const list = Object.values(records);
+  const loveCount = list.filter((r) => r.loveClub === club.id).length;
+  const hateCount = list.filter((r) => r.hateClub === club.id).length;
+  if (hateCount > 0) return { multiplier: 0.1, loveCount, hateCount };
+  if (loveCount > 0) return { multiplier: Math.min(2, 1 + 0.6 * loveCount), loveCount, hateCount };
+  return { multiplier: 1, loveCount, hateCount };
+}
+
+function preferenceScore(club, records) {
+  const gVibe = groupVibe(records);
+  const cVibe = projectClubVibe(club);
+  const vibeDist = Math.hypot(gVibe.control - cVibe.control, gVibe.star - cVibe.star);
+  const vibeFit = Math.max(0, (1 - vibeDist / Math.hypot(9, 9)) * 10);
+  const groupDrama = avg(records, "dynastyDrama");
+  const balance = LEAGUE_META[club.leagueId].competitiveBalance;
+  const balanceFit = Math.max(0, 10 - Math.abs(groupDrama - balance) * (10 / 9));
+  const groupUnderdog = avg(records, "underdogAffinity");
+  const underdogFit = Math.max(0, 10 - Math.abs(groupUnderdog - club.underdogScore) * (10 / 9));
+  return { vibeFit, balanceFit, underdogFit, cVibe, gVibe };
+}
+
+// ---- Debate & Alignment: consensus + tension ----
+
+function debateAvg(records, key) {
+  const list = Object.values(records);
+  return list.reduce((s, r) => s + r.debate[key], 0) / list.length;
+}
+
+function debateStdev(records, key) {
+  const list = Object.values(records).map((r) => r.debate[key]);
+  const mean = list.reduce((s, v) => s + v, 0) / list.length;
+  const variance = list.reduce((s, v) => s + (v - mean) ** 2, 0) / list.length;
+  return Math.sqrt(variance);
+}
+
+// A dimension is a "Group Tension Point" if the spread of opinion is wide
+// relative to the 1-5 scale (stdev >= 1.1 is a real split, not just noise).
+function groupTensionPoints(records) {
+  return DEBATE_DIMENSIONS
+    .map((d) => ({ ...d, avg: debateAvg(records, d.key), stdev: debateStdev(records, d.key) }))
+    .filter((d) => d.stdev >= 1.1)
+    .sort((a, b) => b.stdev - a.stdev);
+}
+
+// Maps a 1-5 group-average priority onto the 1-10 scale used by league/club
+// attributes, so it can be compared directly via absolute difference.
+function scaleTo10(avg1to5) {
+  return ((avg1to5 - 1) / 4) * 9 + 1;
+}
+
+function debateFit(club, records) {
+  const league = LEAGUE_META[club.leagueId];
+  const cVibe = projectClubVibe(club);
+
+  const goalDensityAvg = debateAvg(records, "goalDensity");
+  const desiredChaos = scaleTo10(goalDensityAvg);
+  const clubChaos = 10 - cVibe.control;
+  const goalDensityFit = Math.max(0, 10 - Math.abs(desiredChaos - clubChaos) * (10 / 9));
+
+  const narrativeAvg = debateAvg(records, "narrativeFocus");
+  const desiredUnderdogForNarrative = scaleTo10(narrativeAvg);
+  const narrativeFocusFit = Math.max(0, 10 - Math.abs(desiredUnderdogForNarrative - club.underdogScore) * (10 / 9));
+
+  const clAvg = debateAvg(records, "clPrestige");
+  const desiredPrestige = scaleTo10(clAvg);
+  const clPrestigeFit = Math.max(0, 10 - Math.abs(desiredPrestige - league.continentalPrestige) * (10 / 9));
+
+  const relegationAvg = debateAvg(records, "relegationDrama");
+  const desiredRelegationDrama = scaleTo10(relegationAvg);
+  const relegationDramaFit = Math.max(0, 10 - Math.abs(desiredRelegationDrama - league.relegationDrama) * (10 / 9));
+
+  const usmntAvg = debateAvg(records, "usmntExposure");
+  const desiredUsmnt = scaleTo10(usmntAvg);
+  const usmntBaseFit = Math.max(0, 10 - Math.abs(desiredUsmnt - league.usmntConcentration) * (10 / 9));
+  const usmntClubBonus = club.nations.includes("USA") ? (usmntAvg - 1) / 4 * 2 : 0; // up to +2 if club has US talent and it matters
+  const usmntExposureFit = Math.min(10, usmntBaseFit + usmntClubBonus);
+
+  const antiDomAvg = debateAvg(records, "antiDominance");
+  const desiredParity = scaleTo10(antiDomAvg);
+  const antiDominanceFit = Math.max(0, 10 - Math.abs(desiredParity - league.competitiveBalance) * (10 / 9));
+
+  const atmosphereAvg = debateAvg(records, "stadiumAtmosphere");
+  const desiredAtmosphere = scaleTo10(atmosphereAvg);
+  const stadiumAtmosphereFit = Math.max(0, 10 - Math.abs(desiredAtmosphere - club.rivalry.intensity) * (10 / 9));
+
+  const learningAvg = debateAvg(records, "learningCurve");
+  const desiredUnderdogForLearning = scaleTo10(learningAvg);
+  const learningCurveFit = Math.max(0, 10 - Math.abs(desiredUnderdogForLearning - club.underdogScore) * (10 / 9));
+
+  const fits = {
+    goalDensity: { avg: goalDensityAvg, fit: goalDensityFit },
+    narrativeFocus: { avg: narrativeAvg, fit: narrativeFocusFit },
+    clPrestige: { avg: clAvg, fit: clPrestigeFit },
+    relegationDrama: { avg: relegationAvg, fit: relegationDramaFit },
+    usmntExposure: { avg: usmntAvg, fit: usmntExposureFit },
+    antiDominance: { avg: antiDomAvg, fit: antiDominanceFit },
+    stadiumAtmosphere: { avg: atmosphereAvg, fit: stadiumAtmosphereFit },
+    learningCurve: { avg: learningAvg, fit: learningCurveFit },
+  };
+
+  const DEBATE_WEIGHT = 0.35; // per-dimension weight; 8 dims max ~28pts, comparable to the original ~16pt max
+  const debateTotal = Object.values(fits).reduce((s, f) => s + f.fit, 0) * DEBATE_WEIGHT;
+
+  return { fits, debateTotal };
+}
+
+function tallyNations(records) {
+  const votes = {};
+  Object.values(records).forEach((r) => [r.tactical, r.enjoyable].forEach((n) => { if (n) votes[n] = (votes[n] || 0) + 1; }));
+  let top = null, max = 0;
+  Object.entries(votes).forEach(([n, c]) => { if (c > max) { max = c; top = n; } });
+  return { topNation: top };
+}
+
+function highDramaPreference(records) {
+  const list = Object.values(records);
+  const chaosVotes = list.filter((r) => {
+    const opt = ALL_NATIONS.find((o) => o.nation === r.enjoyable);
+    return opt && opt.style === "chaos";
+  }).length;
+  return chaosVotes > list.length / 2;
+}
+
+function calculateClubFit(club, records) {
+  const pref = preferenceScore(club, records);
+  const access = accessMultiplier(club, records);
+  const time = timeMultiplier(club, records);
+  const loyalty = loyaltyMultiplier(club, records);
+  const drama = highDramaPreference(records);
+  const { topNation } = tallyNations(records);
+  const debate = debateFit(club, records);
+
+  const rivalryBonus = drama ? club.rivalry.intensity * 0.4 : 0;
+  const nationalMatch = topNation ? club.nations.includes(topNation) : false;
+  const nationalBoost = nationalMatch ? 2 : 0;
+
+  const rawTotal = pref.vibeFit + pref.balanceFit * 0.6 + pref.underdogFit * 0.6
+    + rivalryBonus + nationalBoost + debate.debateTotal;
+  const finalScore = rawTotal * access.multiplier * time.multiplier * loyalty.multiplier;
+
+  return { club, finalScore, rawTotal, pref, access, time, loyalty, drama, rivalryBonus, nationalMatch, nationalBoost, topNation, debate };
+}
+
+function rankClubs(records) {
+  return CLUB_DATA.map((c) => calculateClubFit(c, records)).sort((a, b) => b.finalScore - a.finalScore);
+}
+
+/* =========================================================================
+   LAYER 3 — UI (identical visual language to the Claude-artifact version)
+   ========================================================================= */
+
+const COLORS = {
+  pitch: "#0B3D2E", pitchDark: "#082C21", panel: "#0F2E24", line: "#2C463A",
+  chalk: "#F3EFE4", muted: "#8FA396", faint: "#B8AF98", gold: "#C7A046", red: "#B23A2E", green: "#5A8B72",
+};
+const FONT_DISPLAY = "'Teko', sans-serif";
+const FONT_MONO = "'IBM Plex Mono', monospace";
+
+function ToggleService({ label, active, onClick }) {
+  return (
+    <button onClick={onClick} className="px-2.5 py-1 rounded-full text-[11px] font-semibold tracking-wide transition-colors border"
+      style={{ fontFamily: FONT_MONO, background: active ? COLORS.gold : "transparent", color: active ? "#14231D" : COLORS.faint, borderColor: active ? COLORS.gold : COLORS.line }}>
+      {label}
+    </button>
+  );
+}
+function Field({ label, children }) {
+  return (
+    <div className="mb-3">
+      <div className="text-[10px] uppercase tracking-widest mb-1.5" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>{label}</div>
+      {children}
+    </div>
+  );
+}
+function NationSelect({ label, value, onChange }) {
+  return (
+    <Field label={label}>
+      <select className="tactics-select" value={value || ""} onChange={(e) => onChange(e.target.value)}>
+        {NATION_GROUPS.map((g) => (
+          <optgroup key={g.label} label={g.label}>
+            {g.teams.map((t) => <option key={t.nation} value={t.nation}>{t.nation}</option>)}
+          </optgroup>
+        ))}
+      </select>
+    </Field>
+  );
+}
+function ClubSelect({ label, value, onChange }) {
+  return (
+    <Field label={label}>
+      <select className="tactics-select" value={value || "none"} onChange={(e) => onChange(e.target.value)}>
+        <option value="none">None</option>
+        {Object.keys(LEAGUE_META).map((leagueId) => (
+          <optgroup key={leagueId} label={LEAGUE_META[leagueId].name}>
+            {CLUB_DATA.filter((c) => c.leagueId === leagueId).map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </optgroup>
+        ))}
+      </select>
+    </Field>
+  );
+}
+function KickoffSelect({ value, onChange }) {
+  return (
+    <Field label="Earliest kickoff you'll realistically watch live (Eastern Time)">
+      <select className="tactics-select" value={value} onChange={(e) => onChange(e.target.value)}>
+        {KICKOFF_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label || `${o.value} ET`}</option>)}
+      </select>
+    </Field>
+  );
+}
+function VibeSlider({ leftLabel, rightLabel, value, onChange }) {
+  return (
+    <div className="mb-3">
+      <div className="flex justify-between text-[10px] uppercase tracking-widest mb-1" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>
+        <span>{leftLabel}</span><span>{rightLabel}</span>
+      </div>
+      <input type="range" min="1" max="10" value={value} onChange={(e) => onChange(Number(e.target.value))} className="tactics-slider w-full" />
+    </div>
+  );
+}
+
+function DebateSlider({ dim, value, onChange }) {
+  return (
+    <div className="mb-3">
+      <div className="text-[11px] font-semibold mb-1" style={{ color: COLORS.chalk }}>{dim.label}</div>
+      <div className="flex justify-between text-[10px] uppercase tracking-widest mb-1" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>
+        <span>{dim.left}</span><span>{dim.right}</span>
+      </div>
+      <input type="range" min="1" max="5" step="1" value={value} onChange={(e) => onChange(Number(e.target.value))} className="tactics-slider w-full" />
+    </div>
+  );
+}
+
+function LoginScreen({ onLogin }) {
+  const [selected, setSelected] = useState(null);
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const submit = () => {
+    if (!selected) { setError("Pick your name first."); return; }
+    if (CREDENTIALS[selected] !== password) { setError("Wrong password. Ask Sean."); return; }
+    setError(""); onLogin(selected);
+  };
+  return (
+    <div className="min-h-screen flex items-center justify-center px-6" style={{ background: COLORS.pitch }}>
+      <div className="w-full max-w-sm">
+        <div className="text-[11px] uppercase tracking-[0.2em] mb-2" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Locker Room Access</div>
+        <h1 className="text-4xl font-bold mb-6" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk }}>WHO'S CHECKING IN?</h1>
+        <div className="grid grid-cols-2 gap-2 mb-5">
+          {FRIEND_IDS.map((id) => (
+            <button key={id} onClick={() => { setSelected(id); setError(""); }} className="rounded-lg p-3 border text-left transition-colors"
+              style={{ background: selected === id ? COLORS.gold : COLORS.panel, borderColor: selected === id ? COLORS.gold : COLORS.line }}>
+              <div className="text-2xl font-bold leading-none" style={{ fontFamily: FONT_DISPLAY, color: selected === id ? "#14231D" : COLORS.gold }}>
+                {String(FRIEND_META[id].number).padStart(2, "0")}
+              </div>
+              <div className="text-sm font-semibold" style={{ fontFamily: FONT_DISPLAY, color: selected === id ? "#14231D" : COLORS.chalk }}>
+                {FRIEND_META[id].name.toUpperCase()}
+              </div>
+            </button>
+          ))}
+        </div>
+        <input type="password" placeholder="Password" value={password} onChange={(e) => setPassword(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && submit()} className="tactics-select mb-3" />
+        {error && <div className="text-[12px] mb-3" style={{ color: COLORS.red }}>{error}</div>}
+        <button onClick={submit} className="w-full py-2.5 rounded-lg font-semibold text-sm" style={{ background: COLORS.gold, color: "#14231D", fontFamily: FONT_DISPLAY, letterSpacing: "0.03em" }}>ENTER</button>
+      </div>
+    </div>
+  );
+}
+
+function TacticsBoard({ ranked, records, title }) {
+  const gVibe = groupVibe(records);
+  const w = 560, h = 300, pad = 40;
+  const sx = (v) => pad + (v / 10) * (w - pad * 2);
+  const sy = (v) => h - pad - (v / 10) * (h - pad * 2);
+  return (
+    <div className="rounded-lg border p-4" style={{ background: COLORS.pitchDark, borderColor: COLORS.line }}>
+      <div className="text-[10px] uppercase tracking-widest mb-2" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>{title}</div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="w-full" style={{ maxHeight: 300 }}>
+        {[0, 2.5, 5, 7.5, 10].map((v) => <line key={"v" + v} x1={sx(v)} y1={pad} x2={sx(v)} y2={h - pad} stroke="#1E3B30" strokeDasharray="3 4" />)}
+        {[0, 2.5, 5, 7.5, 10].map((v) => <line key={"h" + v} x1={pad} y1={sy(v)} x2={w - pad} y2={sy(v)} stroke="#1E3B30" strokeDasharray="3 4" />)}
+        <line x1={sx(5)} y1={pad} x2={sx(5)} y2={h - pad} stroke={COLORS.line} />
+        <line x1={pad} y1={sy(5)} x2={w - pad} y2={sy(5)} stroke={COLORS.line} />
+        <text x={w / 2} y={h - 6} textAnchor="middle" fontSize="10" fill={COLORS.muted} fontFamily={FONT_MONO}>CHAOS ← → CONTROL</text>
+        <text x={12} y={h / 2} textAnchor="middle" fontSize="10" fill={COLORS.muted} fontFamily={FONT_MONO} transform={`rotate(-90 12 ${h / 2})`}>COLLECTIVE ← → INDIVIDUAL</text>
+        {ranked.map((r) => {
+          const v = r.pref.cVibe;
+          return <circle key={r.club.id} cx={sx(v.control)} cy={sy(v.star)} r={7} fill={r.club.color} stroke="#0B3D2E" strokeWidth="1.5" />;
+        })}
+        <text x={sx(gVibe.control)} y={sy(gVibe.star) + 5} textAnchor="middle" fontSize="20" fill={COLORS.gold}>★</text>
+      </svg>
+      <div className="flex flex-wrap gap-3 mt-2">
+        {ranked.slice(0, 8).map((r) => (
+          <div key={r.club.id} className="flex items-center gap-1.5 text-[11px]" style={{ color: "#D9D2BE", fontFamily: FONT_MONO }}>
+            <span className="inline-block w-2.5 h-2.5 rounded-full" style={{ background: r.club.color }} />{r.club.name}
+          </div>
+        ))}
+        <div className="flex items-center gap-1.5 text-[11px]" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>★ Your group</div>
+      </div>
+    </div>
+  );
+}
+
+function ScoutBar({ label, value, max, color }) {
+  const pct = Math.max(0, Math.min(100, (value / max) * 100));
+  return (
+    <div className="mb-1.5">
+      <div className="flex justify-between text-[10px] mb-0.5" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>
+        <span>{label}</span><span>{value.toFixed(1)}</span>
+      </div>
+      <div className="h-1.5 rounded-full" style={{ background: "#1E3B30" }}>
+        <div className="h-1.5 rounded-full" style={{ width: `${pct}%`, background: color }} />
+      </div>
+    </div>
+  );
+}
+
+function fmtHour(h) {
+  const hr = Math.floor(h);
+  const min = h % 1 === 0.5 ? "30" : "00";
+  return `${hr}:${min} ET`;
+}
+
+function debateNarration(result) {
+  // Pick the 1-2 debate dimensions with the strongest group conviction
+  // (avg farthest from the neutral midpoint of 3) AND a good fit for this
+  // club, matching the required output format: "Based on your group's high
+  // priority for X (4.8/5) ... [club] is your recommended pick."
+  const entries = DEBATE_DIMENSIONS.map((d) => {
+    const f = result.debate.fits[d.key];
+    return { ...d, avg: f.avg, fit: f.fit, conviction: Math.abs(f.avg - 3) };
+  }).filter((d) => d.conviction >= 0.5 && d.fit >= 6);
+  entries.sort((a, b) => b.conviction * b.fit - a.conviction * a.fit);
+  return entries.slice(0, 2).map((d) => {
+    const pole = d.avg >= 3 ? d.right : d.left;
+    return `a high priority on ${d.label} (${d.avg.toFixed(1)}/5, leaning "${pole}")`;
+  });
+}
+
+function buildScoutingCopy(result, rank) {
+  const { club, access, time, loyalty, pref, drama, rivalryBonus, nationalMatch, topNation } = result;
+  const controlWord = pref.gVibe.control >= 6 ? "control-minded" : pref.gVibe.control <= 4 ? "drawn to chaos" : "split between control and chaos";
+  const starWord = pref.gVibe.star >= 6 ? "leaning toward individual flair" : pref.gVibe.star <= 4 ? "collective-strategy people" : "balanced between stars and systems";
+  const parts = [];
+
+  const debateReasons = debateNarration(result);
+  if (debateReasons.length) {
+    parts.push(`Based on your group's ${debateReasons.join(" and ")}, ${club.name} is a strong match.`);
+  }
+
+  parts.push(`The group reads as ${controlWord} and ${starWord} — ${club.name}'s ${club.tacticalDNA.toLowerCase()} identity lands ${pref.vibeFit >= 7 ? "squarely" : pref.vibeFit >= 5 ? "reasonably" : "loosely"} in that zone.`);
+
+  if (access.covered === access.total) parts.push(`Everyone submitted already has ${access.league.name} access via ${access.league.streaming.join(" or ")}.`);
+  else if (access.covered === 0) parts.push(`Nobody's submitted profile has ${access.league.streaming.join(" or ")} yet — real barrier for ${access.league.name}.`);
+  else parts.push(`${access.covered} of ${access.total} have ${access.league.streaming.join(" or ")}, which trims the score but isn't fatal.`);
+
+  if (time.covered === time.total) parts.push(`Kickoff time is a non-issue — ${access.league.name} typically kicks off around ${fmtHour(time.typicalET)}, which works for everyone.`);
+  else if (time.covered === 0) parts.push(`Nobody's up for a ${fmtHour(time.typicalET)} kickoff, which is ${access.league.name}'s typical slot — that's the single biggest drag on this pick.`);
+  else parts.push(`${time.covered} of ${time.total} of you can realistically watch a ${fmtHour(time.typicalET)} kickoff, which is when ${access.league.name} usually plays.`);
+
+  if (drama && rivalryBonus > 0) parts.push(`Since enjoyment picks skew chaotic, ${club.rivalry.name} (intensity ${club.rivalry.intensity}/10) counts as a real selling point.`);
+  if (nationalMatch) parts.push(`${topNation} came up as a shared World Cup favorite, and ${club.name}'s roster carries heavy ${topNation} representation.`);
+  if (loyalty.hateCount > 0) parts.push(`Heads up — someone in the group really doesn't want to watch ${club.name}. That's dragging this pick down hard on purpose.`);
+  else if (loyalty.loveCount > 0) parts.push(`Someone in the group already has a soft spot for ${club.name}, which nudges this one up.`);
+
+  return `#${rank} ${club.name.toUpperCase()} (${access.league.name}) — ${result.finalScore.toFixed(1)} pts. ` + parts.join(" ");
+}
+
+function ScoutingCard({ result, rank }) {
+  const { club, finalScore, access, time, loyalty, pref, rivalryBonus, nationalBoost, debate } = result;
+  const styleFit = (pref.vibeFit + pref.balanceFit + pref.underdogFit) / 3;
+  const debateFitAvg = Object.values(debate.fits).reduce((s, f) => s + f.fit, 0) / Object.values(debate.fits).length;
+  return (
+    <div className="rounded-lg border overflow-hidden" style={{ borderColor: COLORS.line }}>
+      <div className="px-4 py-3 flex items-center gap-3" style={{ background: club.color }}>
+        <span className="text-3xl font-bold" style={{ fontFamily: FONT_DISPLAY, color: "rgba(255,255,255,0.35)" }}>{rank}</span>
+        <div>
+          <div className="text-xl font-bold leading-tight" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk, letterSpacing: "0.02em" }}>{club.name.toUpperCase()}</div>
+          <div className="text-[11px]" style={{ color: "rgba(255,255,255,0.75)", fontFamily: FONT_MONO }}>{LEAGUE_META[club.leagueId].name} · {club.rivalry.name}</div>
+        </div>
+        <div className="ml-auto text-right">
+          <div className="text-2xl font-bold leading-none" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk }}>{finalScore.toFixed(1)}</div>
+          <div className="text-[9px] uppercase tracking-widest" style={{ color: "rgba(255,255,255,0.6)" }}>fit score</div>
+        </div>
+      </div>
+      <div className="p-4" style={{ background: COLORS.panel }}>
+        <p className="text-[13px] leading-relaxed mb-3" style={{ color: "#D9D2BE" }}>{buildScoutingCopy(result, rank)}</p>
+        <ScoutBar label="Vibe + style fit (of 10)" value={styleFit} max={10} color={COLORS.gold} />
+        <ScoutBar label="Streaming access" value={access.multiplier * 10} max={10} color={COLORS.green} />
+        <ScoutBar label="Kickoff-time fit" value={time.multiplier * 10} max={10} color="#5A7A9B" />
+        <ScoutBar label="Rivalry + national bonus" value={rivalryBonus + nationalBoost} max={6} color={COLORS.red} />
+        <ScoutBar label="Debate & Alignment fit (of 10)" value={debateFitAvg} max={10} color="#8B6FB3" />
+        {loyalty.multiplier !== 1 && (
+          <div className="text-[10px] mt-1" style={{ color: loyalty.hateCount > 0 ? COLORS.red : COLORS.gold, fontFamily: FONT_MONO }}>
+            Loyalty adjustment: ×{loyalty.multiplier.toFixed(2)}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function InputPanel({ userId, record, setRecord, onSave, saveState, onGoResults, submissionCount }) {
+  const meta = FRIEND_META[userId];
+  const update = (patch) => setRecord({ ...record, ...patch });
+  return (
+    <div className="min-h-screen px-6 py-8" style={{ background: COLORS.pitch }}>
+      <GlobalStyle />
+      <div className="max-w-md mx-auto">
+        <div className="text-[11px] uppercase tracking-[0.2em] mb-1" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Your locker, only your locker</div>
+        <h1 className="text-4xl font-bold mb-1" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk }}>{meta.name.toUpperCase()} · #{meta.number}</h1>
+        <p className="text-[13px] mb-5" style={{ color: COLORS.faint }}>
+          {submissionCount} of {FRIEND_IDS.length} locker room entries submitted so far. No one sees your individual answers — only the combined result.
+        </p>
+
+        <div className="rounded-lg p-4 border mb-4" style={{ background: COLORS.panel, borderColor: COLORS.line }}>
+          <Field label="Streaming inventory">
+            <div className="flex flex-wrap gap-1.5">
+              {STREAMING_SERVICES.map((svc) => (
+                <ToggleService key={svc} label={svc} active={record.streaming[svc]} onClick={() => update({ streaming: { ...record.streaming, [svc]: !record.streaming[svc] } })} />
+              ))}
+            </div>
+          </Field>
+          <KickoffSelect value={record.earliestET} onChange={(v) => update({ earliestET: v })} />
+        </div>
+
+        <div className="rounded-lg p-4 border mb-4" style={{ background: COLORS.panel, borderColor: COLORS.line }}>
+          <NationSelect label="Most tactically impressive team (control/possession)" value={record.tactical} onChange={(v) => update({ tactical: v })} />
+          <NationSelect label="Most enjoyable watch (chaos/end-to-end)" value={record.enjoyable} onChange={(v) => update({ enjoyable: v })} />
+        </div>
+
+        <div className="rounded-lg p-4 border mb-4" style={{ background: COLORS.panel, borderColor: COLORS.line }}>
+          <VibeSlider leftLabel="Chaotic end-to-end" rightLabel="Match control" value={record.control} onChange={(v) => update({ control: v })} />
+          <VibeSlider leftLabel="Individual star power" rightLabel="Collective strategy" value={record.star} onChange={(v) => update({ star: v })} />
+          <VibeSlider leftLabel="Dynasty is fine" rightLabel="Give me a real title race" value={record.dynastyDrama} onChange={(v) => update({ dynastyDrama: v })} />
+          <VibeSlider leftLabel="Glamour giants" rightLabel="Scrappy underdogs" value={record.underdogAffinity} onChange={(v) => update({ underdogAffinity: v })} />
+        </div>
+
+        <div className="rounded-lg p-4 border mb-5" style={{ background: COLORS.panel, borderColor: COLORS.line }}>
+          <ClubSelect label="A club you already love (optional — big boost)" value={record.loveClub} onChange={(v) => update({ loveClub: v })} />
+          <ClubSelect label="A club you can't stand (optional — kills the pick)" value={record.hateClub} onChange={(v) => update({ hateClub: v })} />
+        </div>
+
+        <div className="rounded-lg p-4 border mb-5" style={{ background: COLORS.panel, borderColor: COLORS.line }}>
+          <div className="text-[11px] uppercase tracking-[0.2em] mb-3" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Debate &amp; Alignment</div>
+          {DEBATE_DIMENSIONS.map((dim) => (
+            <DebateSlider
+              key={dim.key}
+              dim={dim}
+              value={record.debate[dim.key]}
+              onChange={(v) => update({ debate: { ...record.debate, [dim.key]: v } })}
+            />
+          ))}
+        </div>
+
+        <button onClick={onSave} className="w-full py-2.5 rounded-lg font-semibold text-sm mb-2" style={{ background: COLORS.gold, color: "#14231D", fontFamily: FONT_DISPLAY, letterSpacing: "0.03em" }}>
+          {saveState === "saving" ? "SAVING…" : saveState === "saved" ? "SAVED ✓" : "SAVE MY PICKS"}
+        </button>
+        {saveState === "error" && <div className="text-[12px] mb-2" style={{ color: COLORS.red }}>Couldn't save — check your connection and try again.</div>}
+        <button onClick={onGoResults} className="w-full py-2.5 rounded-lg font-semibold text-sm border" style={{ borderColor: COLORS.line, color: COLORS.chalk, fontFamily: FONT_DISPLAY, letterSpacing: "0.03em" }}>
+          VIEW GROUP RESULTS
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function TensionPoints({ records }) {
+  const points = useMemo(() => groupTensionPoints(records), [records]);
+  if (!points.length) return null;
+  return (
+    <div className="rounded-lg border p-4 mb-6" style={{ background: "#2A1810", borderColor: COLORS.red }}>
+      <div className="text-[11px] uppercase tracking-[0.2em] mb-2" style={{ color: COLORS.red, fontFamily: FONT_MONO }}>⚠ Group Tension Points</div>
+      <p className="text-[12px] mb-2" style={{ color: COLORS.faint }}>
+        The group is genuinely split on these — worth a real conversation before you lock in a pick, since the algorithm can only average opinions, not resolve them.
+      </p>
+      <ul className="space-y-1">
+        {points.map((p) => (
+          <li key={p.key} className="text-[12px]" style={{ color: COLORS.chalk }}>
+            <span style={{ fontFamily: FONT_MONO, color: COLORS.gold }}>{p.label}</span>
+            {" — "}average {p.avg.toFixed(1)}/5, but opinions range widely (spread: {p.stdev.toFixed(1)}).
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function ResultsPanel({ records, onBack, refreshing, onRefresh }) {
+  const filled = useMemo(() => {
+    const out = {};
+    FRIEND_IDS.forEach((id) => { out[id] = records[id] || DEFAULT_RECORD(); });
+    return out;
+  }, [records]);
+  const ranked = useMemo(() => rankClubs(filled), [filled]);
+  const submissionCount = Object.values(records).filter((r) => r && r.submitted).length;
+
+  return (
+    <div className="min-h-screen px-6 py-8" style={{ background: COLORS.pitch }}>
+      <GlobalStyle />
+      <div className="max-w-3xl mx-auto">
+        <div className="flex items-center justify-between mb-1">
+          <div className="text-[11px] uppercase tracking-[0.2em]" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Group Soccer Team Recommender</div>
+          <button onClick={onRefresh} className="text-[11px] underline" style={{ color: COLORS.muted, fontFamily: FONT_MONO }}>{refreshing ? "refreshing…" : "refresh"}</button>
+        </div>
+        <h1 className="text-5xl font-bold mb-3" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk }}>PICK YOUR CLUB</h1>
+        <p className="text-[13px] mb-6" style={{ color: COLORS.faint }}>
+          {submissionCount} of {FRIEND_IDS.length} of you have saved picks. Anyone who hasn't submitted yet is scored as neutral until they check in.
+        </p>
+
+        <TacticsBoard ranked={ranked} records={filled} title="The Tactics Board — group vs. all 20 clubs" />
+
+        <div className="mt-6">
+          <TensionPoints records={filled} />
+        </div>
+
+        <div className="text-[11px] uppercase tracking-[0.2em] mb-4" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Scouting Report — Top 5</div>
+        <div className="grid gap-4 mb-6">
+          {ranked.slice(0, 5).map((r, i) => <ScoutingCard key={r.club.id} result={r} rank={i + 1} />)}
+        </div>
+
+        <button onClick={onBack} className="w-full py-2.5 rounded-lg font-semibold text-sm border" style={{ borderColor: COLORS.line, color: COLORS.chalk, fontFamily: FONT_DISPLAY, letterSpacing: "0.03em" }}>
+          BACK TO MY LOCKER
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [currentUser, setCurrentUser] = useState(null);
+  const [record, setRecord] = useState(DEFAULT_RECORD());
+  const [saveState, setSaveState] = useState("idle");
+  const [view, setView] = useState("input");
+  const [allRecords, setAllRecords] = useState({});
+  const [refreshing, setRefreshing] = useState(false);
+  const [loading, setLoading] = useState(false);
+
+  const loadOwnRecord = useCallback(async (userId) => {
+    setLoading(true);
+    try {
+      const res = await storageGet(userId);
+      setRecord(res && res.value ? JSON.parse(res.value) : DEFAULT_RECORD());
+    } catch { setRecord(DEFAULT_RECORD()); } finally { setLoading(false); }
+  }, []);
+
+  const loadAllRecords = useCallback(async () => {
+    setRefreshing(true);
+    const out = {};
+    for (const id of FRIEND_IDS) {
+      try {
+        const res = await storageGet(id);
+        if (res && res.value) out[id] = JSON.parse(res.value);
+      } catch { /* not submitted yet */ }
+    }
+    setAllRecords(out);
+    setRefreshing(false);
+  }, []);
+
+  useEffect(() => { if (currentUser) loadOwnRecord(currentUser); }, [currentUser, loadOwnRecord]);
+
+  const handleSave = async () => {
+    setSaveState("saving");
+    try {
+      const toSave = { ...record, submitted: true };
+      const ok = await storageSet(currentUser, toSave);
+      if (ok) { setRecord(toSave); setSaveState("saved"); setTimeout(() => setSaveState("idle"), 1800); }
+      else setSaveState("error");
+    } catch { setSaveState("error"); }
+  };
+
+  const goResults = async () => { await loadAllRecords(); setView("results"); };
+
+  if (!currentUser) return <LoginScreen onLogin={setCurrentUser} />;
+  if (loading) return <div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.pitch, color: COLORS.chalk, fontFamily: FONT_MONO }}>Loading your locker…</div>;
+
+  const submissionCount = Object.values(allRecords).filter((r) => r && r.submitted).length || (record.submitted ? 1 : 0);
+
+  if (view === "results") {
+    return <ResultsPanel records={allRecords} onBack={() => setView("input")} refreshing={refreshing} onRefresh={loadAllRecords} />;
+  }
+  return <InputPanel userId={currentUser} record={record} setRecord={setRecord} onSave={handleSave} saveState={saveState} onGoResults={goResults} submissionCount={submissionCount} />;
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>

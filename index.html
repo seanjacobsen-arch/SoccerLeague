@@ -106,14 +106,25 @@ try {
   console.error("Firebase failed to initialize:", err);
 }
 
+// Firestore calls against an unreachable/invalid project don't reject
+// quickly -- the SDK assumes a transient network blip and keeps retrying.
+// Without a timeout, a bad config leaves the UI stuck on a loading spinner
+// forever instead of falling back to defaults.
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out contacting storage")), ms)),
+  ]);
+}
+
 async function storageGet(key) {
   if (!db) throw new Error("Storage not configured (Firebase did not initialize)");
-  const doc = await db.collection("picks").doc(key).get();
+  const doc = await withTimeout(db.collection("picks").doc(key).get(), 8000);
   return doc.exists ? { value: JSON.stringify(doc.data()) } : null;
 }
 async function storageSet(key, valueObj) {
   if (!db) throw new Error("Storage not configured (Firebase did not initialize)");
-  await db.collection("picks").doc(key).set(valueObj);
+  await withTimeout(db.collection("picks").doc(key).set(valueObj), 8000);
   return true;
 }
 

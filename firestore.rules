@@ -1,0 +1,12 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Single collection "picks", one document per friend (josh/matt/kevin/sean).
+    // Open read/write is fine here: this is a private link shared with 4
+    // people, the app-level password screen is the actual gate, and nothing
+    // sensitive is stored (just soccer preferences).
+    match /picks/{friendId} {
+      allow read, write: if true;
+    }
+  }
+}

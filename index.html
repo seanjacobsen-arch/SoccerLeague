@@ -28,6 +28,32 @@
 <body>
 <div id="root"></div>
 
+<script>
+  // Safety net: if nothing has rendered into #root a couple seconds after
+  // load, something failed before React could even start (a syntax error
+  // in an edited section, a blocked CDN script, etc). Show a real message
+  // instead of leaving the page blank with no clue what happened.
+  window.addEventListener("load", function () {
+    setTimeout(function () {
+      var root = document.getElementById("root");
+      if (root && root.children.length === 0) {
+        root.innerHTML =
+          '<div style="font-family:sans-serif;max-width:640px;margin:60px auto;padding:24px;' +
+          'background:#2A1810;color:#F3EFE4;border-radius:10px;border:1px solid #B23A2E;line-height:1.5;">' +
+          '<h2 style="margin-top:0;color:#C7A046;">The app didn\'t load</h2>' +
+          "<p>Something failed before the page could render. Open your browser's developer console " +
+          "(press F12, or right-click anywhere \u2192 Inspect \u2192 Console tab) and look for a red error " +
+          "message near the top \u2014 copy that text, it says exactly what broke.</p>" +
+          '<p style="opacity:0.75;font-size:13px;">Common cause: the Firebase config block was edited ' +
+          "incorrectly \u2014 e.g. pasting the modern <code>import { initializeApp } from \"firebase/app\"</code> " +
+          "snippet from the Firebase console instead of just the plain config object. This file needs only " +
+          "the <code>const firebaseConfig = {...}</code> object itself, nothing else.</p>" +
+          "</div>";
+      }
+    }, 2000);
+  });
+</script>
+
 <script type="text/babel" data-presets="react">
 const { useState, useEffect, useMemo, useCallback } = React;
 
@@ -51,6 +77,12 @@ const { useState, useEffect, useMemo, useCallback } = React;
             }
           }
         }
+   IMPORTANT: paste ONLY the plain object below. Do not paste the modern
+   `import { initializeApp } from "firebase/app"` snippet some Firebase
+   console pages show by default — this file uses the older global/"compat"
+   script style loaded above, so an `import` statement here will throw a
+   syntax error and stop the entire page from rendering (a blank screen
+   with no visible message, only an error in the browser console).
    ========================================================================= */
 const firebaseConfig = {
   apiKey: "PASTE_YOUR_API_KEY",
@@ -60,14 +92,27 @@ const firebaseConfig = {
   messagingSenderId: "PASTE_YOUR_SENDER_ID",
   appId: "PASTE_YOUR_APP_ID",
 };
-firebase.initializeApp(firebaseConfig);
-const db = firebase.firestore();
+
+// If Firebase fails to initialize (bad config, blocked network, config
+// still just placeholders), the app should still render — just without
+// saving working. A crash here must never take down the whole page.
+let db = null;
+let firebaseInitError = null;
+try {
+  firebase.initializeApp(firebaseConfig);
+  db = firebase.firestore();
+} catch (err) {
+  firebaseInitError = err;
+  console.error("Firebase failed to initialize:", err);
+}
 
 async function storageGet(key) {
+  if (!db) throw new Error("Storage not configured (Firebase did not initialize)");
   const doc = await db.collection("picks").doc(key).get();
   return doc.exists ? { value: JSON.stringify(doc.data()) } : null;
 }
 async function storageSet(key, valueObj) {
+  if (!db) throw new Error("Storage not configured (Firebase did not initialize)");
   await db.collection("picks").doc(key).set(valueObj);
   return true;
 }
@@ -1034,11 +1079,25 @@ function App() {
   const [refreshing, setRefreshing] = useState(false);
   const [loading, setLoading] = useState(false);
 
+  // Backfills any fields missing from an older saved record (e.g. one saved
+  // before the Debate & Alignment module existed) so loading old data never
+  // crashes the app on a missing key like record.debate.goalDensity.
+  const mergeWithDefaults = (saved) => {
+    const def = DEFAULT_RECORD();
+    if (!saved || typeof saved !== "object") return def;
+    return {
+      ...def,
+      ...saved,
+      streaming: { ...def.streaming, ...(saved.streaming || {}) },
+      debate: { ...def.debate, ...(saved.debate || {}) },
+    };
+  };
+
   const loadOwnRecord = useCallback(async (userId) => {
     setLoading(true);
     try {
       const res = await storageGet(userId);
-      setRecord(res && res.value ? JSON.parse(res.value) : DEFAULT_RECORD());
+      setRecord(res && res.value ? mergeWithDefaults(JSON.parse(res.value)) : DEFAULT_RECORD());
     } catch { setRecord(DEFAULT_RECORD()); } finally { setLoading(false); }
   }, []);
 
@@ -1048,7 +1107,7 @@ function App() {
     for (const id of FRIEND_IDS) {
       try {
         const res = await storageGet(id);
-        if (res && res.value) out[id] = JSON.parse(res.value);
+        if (res && res.value) out[id] = mergeWithDefaults(JSON.parse(res.value));
       } catch { /* not submitted yet */ }
     }
     setAllRecords(out);
@@ -1069,18 +1128,45 @@ function App() {
 
   const goResults = async () => { await loadAllRecords(); setView("results"); };
 
-  if (!currentUser) return <LoginScreen onLogin={setCurrentUser} />;
-  if (loading) return <div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.pitch, color: COLORS.chalk, fontFamily: FONT_MONO }}>Loading your locker…</div>;
+  const banner = firebaseInitError || !db ? (
+    <div style={{ background: "#B23A2E", color: "#F3EFE4", padding: "10px 16px", fontSize: "13px", textAlign: "center", fontFamily: FONT_MONO }}>
+      ⚠ Storage isn't configured yet — picks won't be saved. Paste your Firebase config near the top of this file.
+    </div>
+  ) : null;
+
+  if (!currentUser) return <>{banner}<LoginScreen onLogin={setCurrentUser} /></>;
+  if (loading) return <>{banner}<div className="min-h-screen flex items-center justify-center" style={{ background: COLORS.pitch, color: COLORS.chalk, fontFamily: FONT_MONO }}>Loading your locker…</div></>;
 
   const submissionCount = Object.values(allRecords).filter((r) => r && r.submitted).length || (record.submitted ? 1 : 0);
 
   if (view === "results") {
-    return <ResultsPanel records={allRecords} onBack={() => setView("input")} refreshing={refreshing} onRefresh={loadAllRecords} />;
+    return <>{banner}<ResultsPanel records={allRecords} onBack={() => setView("input")} refreshing={refreshing} onRefresh={loadAllRecords} /></>;
   }
-  return <InputPanel userId={currentUser} record={record} setRecord={setRecord} onSave={handleSave} saveState={saveState} onGoResults={goResults} submissionCount={submissionCount} />;
+  return <>{banner}<InputPanel userId={currentUser} record={record} setRecord={setRecord} onSave={handleSave} saveState={saveState} onGoResults={goResults} submissionCount={submissionCount} /></>;
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+// Top-level error boundary: if any component throws during render (a bad
+// saved value, an unexpected null, etc.), show a real message instead of
+// leaving the page blank.
+class ErrorBoundary extends React.Component {
+  constructor(props) { super(props); this.state = { error: null }; }
+  static getDerivedStateFromError(error) { return { error }; }
+  componentDidCatch(error, info) { console.error("Render error:", error, info); }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ fontFamily: "sans-serif", maxWidth: 640, margin: "60px auto", padding: 24, background: "#2A1810", color: "#F3EFE4", borderRadius: 10, border: "1px solid #B23A2E", lineHeight: 1.5 }}>
+          <h2 style={{ marginTop: 0, color: "#C7A046" }}>Something broke while rendering</h2>
+          <p>{String(this.state.error.message || this.state.error)}</p>
+          <p style={{ opacity: 0.75, fontSize: 13 }}>Open the browser console (F12) for the full stack trace.</p>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<ErrorBoundary><App /></ErrorBoundary>);
 </script>
 </body>
 </html>

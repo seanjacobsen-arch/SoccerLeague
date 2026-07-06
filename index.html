@@ -948,7 +948,6 @@ function InputPanel({ userId, record, setRecord, onSave, saveState, onGoResults,
   const update = (patch) => setRecord({ ...record, ...patch });
   return (
     <div className="min-h-screen px-6 py-8" style={{ background: COLORS.pitch }}>
-      <GlobalStyle />
       <div className="max-w-md mx-auto">
         <div className="text-[11px] uppercase tracking-[0.2em] mb-1" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Your locker, only your locker</div>
         <h1 className="text-4xl font-bold mb-1" style={{ fontFamily: FONT_DISPLAY, color: COLORS.chalk }}>{meta.name.toUpperCase()} · #{meta.number}</h1>
@@ -1040,7 +1039,6 @@ function ResultsPanel({ records, onBack, refreshing, onRefresh }) {
 
   return (
     <div className="min-h-screen px-6 py-8" style={{ background: COLORS.pitch }}>
-      <GlobalStyle />
       <div className="max-w-3xl mx-auto">
         <div className="flex items-center justify-between mb-1">
           <div className="text-[11px] uppercase tracking-[0.2em]" style={{ color: COLORS.gold, fontFamily: FONT_MONO }}>Group Soccer Team Recommender</div>

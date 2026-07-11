@@ -1,142 +1,169 @@
-# Pick Your Club — Group Soccer Recommender
+# Soccer Dashboard — Personal PWA
 
-A password-gated, 4-person soccer club recommender (Josh, Matt, Kevin, Sean).
-Single static file, no build step — just `index.html`. Picks are stored in
-Firebase Firestore so everyone's answers combine into one shared result.
+A personal, installable PWA for checking Big 5 league scores, standings, weekend
+recaps, and getting a push notification ahead of the week's biggest matches.
+Not a live-scores app — on-demand checking, plus a scheduled Thursday/Friday
+alert for match-of-the-week games.
 
----
-
-## Instructions for Claude Code
-
-If you're Claude Code reading this to set the project up, here's the exact
-sequence. Ask the user (Sean) for anything marked **ASK USER** before
-proceeding — don't guess at these.
-
-### 1. Initialize the repo
-
-```bash
-cd <this project folder>
-git init
-git add index.html firestore.rules README.md
-git commit -m "Initial commit: group soccer club recommender"
-```
-
-### 2. Create the GitHub repo and push
-
-If the `gh` CLI is authenticated:
-
-```bash
-gh repo create soccer-club-recommender --public --source=. --remote=origin --push
-```
-
-If `gh` isn't available or isn't authenticated, ask the user to either:
-- run `gh auth login` first, or
-- create an empty repo manually at github.com/new named `soccer-club-recommender`,
-  then run:
-  ```bash
-  git remote add origin https://github.com/<ASK USER: their username>/soccer-club-recommender.git
-  git branch -M main
-  git push -u origin main
-  ```
-
-### 3. Deploy
-
-Two options — ask the user which they'd prefer, or default to GitHub Pages
-since it requires zero extra accounts:
-
-**Option A — GitHub Pages (simplest):**
-```bash
-gh api repos/<owner>/soccer-club-recommender/pages -X POST -f "source[branch]=main" -f "source[path]=/"
-```
-(Or tell the user: repo Settings → Pages → Deploy from branch → `main` → `/ (root)` → Save.)
-The site will be live at `https://<owner>.github.io/soccer-club-recommender/`.
-
-**Option B — Netlify:** the user has used this before. If they want Claude
-Code to handle it via CLI:
-```bash
-npx netlify-cli deploy --prod --dir=.
-```
-This requires the user to be logged in (`npx netlify-cli login`) first —
-ask them to do that interactively since it opens a browser.
-
-### 4. Firebase setup (required for shared picks to actually save)
-
-This part needs the user's manual input at console.firebase.google.com —
-Claude Code cannot create a Firebase project non-interactively. Ask the user
-to:
-
-1. Go to https://console.firebase.google.com → create a new project (free
-   tier is plenty for 4 people).
-2. Inside the project: **Build a Web app** (the `</>` icon), name it
-   anything, skip Firebase Hosting (not needed — GitHub/Netlify is already
-   handling hosting).
-3. Firebase will show a config object like:
-   ```js
-   const firebaseConfig = {
-     apiKey: "AIza...",
-     authDomain: "project-id.firebaseapp.com",
-     projectId: "project-id",
-     storageBucket: "project-id.appspot.com",
-     messagingSenderId: "123456789",
-     appId: "1:123456789:web:abcdef",
-   };
-   ```
-   **ASK USER** to paste just this object to you (Claude Code).
-4. In **Build → Firestore Database**, click "Create database," start in
-   test mode.
-5. In Firestore → Rules, paste the contents of `firestore.rules` (already
-   in this repo) and publish.
-
-Once you have the config object from the user, open `index.html`, find the
-`const firebaseConfig = { ... }` block near the top of the
-`<script type="text/babel">` section (search for `PASTE_YOUR_API_KEY`), and
-replace the six placeholder values with the real ones. Commit and push:
-
-```bash
-git add index.html
-git commit -m "Add Firebase config"
-git push
-```
-
-### 5. Sanity check
-
-Open the deployed URL. You should see a login screen with four names
-(Josh/Matt/Kevin/Sean) and a password field — **not** a blank page. If it's
-blank, open the browser console (F12) — the app now shows a visible error
-banner or fallback message rather than failing silently, so whatever's
-wrong should be readable there directly.
+Single user, no login system. Dark theme, orange accent.
 
 ---
 
-## What's in this file
+## Architecture
 
-- **Login**: hardcoded passwords per friend (see `CREDENTIALS` near the top
-  of the script). Not real security — just a speed bump for a friend group.
-  Change them by editing that object directly.
-- **Data layer**: `LEAGUE_META` (5 leagues) and `CLUB_DATA` (all 96 clubs
-  across the real 2026–27 Premier League / Bundesliga / Serie A / La Liga /
-  Ligue 1 rosters) — this is the "source of truth." Edit club playstyle,
-  rivalries, or nations here.
-- **Recommender engine**: pure functions (`calculateClubFit`, `rankClubs`,
-  etc.) — no UI code, just scoring logic. Weighs streaming access, kickoff
-  time tolerance, vibe/style fit, loyalty (love/hate a club), and the 8
-  "Debate & Alignment" dimensions (goal density, narrative focus, Champions
-  League prestige, relegation drama, USMNT exposure, anti-dominance,
-  atmosphere, learning curve).
-- **Storage**: Firebase Firestore, one document per friend under a `picks`
-  collection. `mergeWithDefaults` protects against old saved data missing
-  newer fields if the schema changes again later.
-- **UI**: plain React (loaded via CDN, JSX compiled in-browser by Babel
-  Standalone — no npm install, no build step, no bundler). Tailwind is also
-  loaded via CDN for utility classes.
+- **Frontend**: static PWA in `public/` — plain HTML/CSS/JS, no build step,
+  no framework. Installable on Android via the manifest + service worker.
+- **Backend**: Netlify Functions in `netlify/functions/` (Node, ESM). These
+  keep the football-data.org and Anthropic API keys server-side and give the
+  push-subscription flow a real endpoint to POST to.
+- **Storage**: [Netlify Blobs](https://docs.netlify.com/blobs/overview/) — a
+  built-in key-value store, used for the cached weekend recap, the cached
+  big-match banner, the stored push subscription, and "what's queued this
+  week." No separate database needed for a single user.
+- **Scheduled job**: `netlify/functions/scheduled-push.js` is a [Netlify
+  Scheduled Function](https://docs.netlify.com/functions/scheduled-functions/)
+  that runs Thursday and Friday, detects the week's big match(es), generates
+  the notification text via Claude, and sends the push.
 
-## Known limitations (flagged honestly, not fixed)
+## Data sources
 
-- Club playstyle ratings, rivalry intensities, and underdog scores are
-  reasonable approximations for flavor, not pulled from a stats provider.
-- Smaller/newly-promoted clubs list only their home country under "key
-  nations" since detailed current-roster nationality data wasn't available
-  when this was built — don't read that as a real squad breakdown.
-- The password gate is client-side only; anyone with the URL and a guessed
-  password could get in. Fine for a private link among friends, not a
-  substitute for real auth.
+- **football-data.org** (free tier, 10 req/min) — Premier League, La Liga,
+  Bundesliga, Serie A, Ligue 1, Champions League, plus Eredivisie, Primeira
+  Liga, and Championship. Competition codes live in
+  `netlify/functions/lib/football-data.js`.
+- **Claude API** (Haiku 4.5) — generates the weekend recap and the big-match
+  notification text from raw match facts (score, teams, competition). Never
+  reproduces published match reports — it's told to use only the facts it's
+  given.
+- **Broadcast/streaming info**: intentionally not included. No API reliably
+  covers this; the spec calls for a hardcoded lookup table if you want it
+  later — not built yet.
+
+## Big-match detection
+
+`netlify/functions/lib/derbies.js` has a hardcoded rivalry list (El Clásico,
+Der Klassiker, North London Derby, etc.) — edit it directly if a fixture
+rivalry is missing. `netlify/functions/lib/big-match-logic.js` also flags
+matches where both teams are in the top 4 and within 4 points of each other,
+or both in the bottom 3 and within 4 points — computed live from standings.
+
+---
+
+## Setup
+
+### 1. Install dependencies
+
+```bash
+npm install
+```
+
+### 2. Get your API keys
+
+**football-data.org** — you said you already have a key. You'll add it as
+`FOOTBALL_DATA_API_KEY` below.
+
+**Anthropic (Claude) API key** — go to
+[console.anthropic.com](https://console.anthropic.com), sign up or log in,
+then **Settings → API Keys → Create Key**. You'll also need a payment method
+under **Settings → Billing** — usage here is a couple of short text
+generations a week, so cost is a few cents a month at most.
+
+### 3. Generate VAPID keys (for push notifications)
+
+```bash
+npx web-push generate-vapid-keys
+```
+
+This prints a public and private key. **Don't commit these to the repo** —
+they go into Netlify's environment variables (next step). Pick any
+`mailto:` address for `VAPID_SUBJECT` — it's only used if a push service
+needs to contact you about your VAPID usage.
+
+### 4. Create the Netlify site and set environment variables
+
+```bash
+npx netlify-cli login      # opens a browser
+npx netlify-cli init       # links this folder to a new or existing Netlify site
+```
+
+Then in the Netlify dashboard for the site (**Site configuration →
+Environment variables**), add:
+
+| Variable | Value |
+|---|---|
+| `FOOTBALL_DATA_API_KEY` | your football-data.org key |
+| `ANTHROPIC_API_KEY` | your Claude API key |
+| `VAPID_PUBLIC_KEY` | from step 3 |
+| `VAPID_PRIVATE_KEY` | from step 3 |
+| `VAPID_SUBJECT` | `mailto:you@example.com` |
+
+### 5. Deploy
+
+```bash
+npx netlify-cli deploy --prod
+```
+
+Netlify Blobs works automatically on deploy — no extra setup needed.
+
+### 6. Install it on your phone
+
+Open the deployed URL in Chrome on Android → menu → **Add to Home screen**.
+Open the app, go to the **Notifications** tab, and toggle notifications on
+to grant permission and register a push subscription. Use **Send test push**
+to confirm it's wired up end-to-end before waiting for the Thursday/Friday
+job.
+
+---
+
+## Local development
+
+```bash
+npm install -g netlify-cli   # if you don't have it
+netlify dev
+```
+
+This runs the functions and static site locally (`http://localhost:8888`)
+with the same routing as production. Local Blobs storage is scoped to your
+machine, so subscriptions/caches won't carry over to production — that's
+expected.
+
+## Project layout
+
+```
+public/                        static PWA (served as-is, no build step)
+  index.html                   single-page shell, 4 views + bottom nav
+  manifest.json                install metadata
+  service-worker.js             handles push events + notification clicks
+  assets/app.js                 view routing, fetch + localStorage cache, push subscribe flow
+  assets/styles.css              dark/orange theme
+  assets/icons/                  app icons
+
+netlify/functions/
+  scores.js                     GET recent results (?scope=big5|all)
+  standings.js                  GET league table(s) (?league=<code> or all Big 5)
+  recap.js                      GET cached/generated weekend recap
+  big-match.js                  GET cached/generated "big match this week" list
+  vapid-public-key.js           GET the public VAPID key for subscribing
+  subscribe.js                  POST/DELETE/GET push subscription
+  send-test-push.js             POST — manual test push
+  queued-notifications.js       GET what the scheduled job queued this week
+  scheduled-push.js             cron (Thu/Fri) — detect big match, generate text, send push
+  lib/football-data.js          football-data.org client + competition list
+  lib/derbies.js                hardcoded rivalry list
+  lib/big-match-logic.js        derby + table-proximity detection
+  lib/weekend-big-matches.js    shared fixture-fetch + detection used by big-match.js and the cron job
+  lib/claude.js                 Claude API wrapper (recap + notification text)
+  lib/push.js                   web-push send helper
+```
+
+## Known limitations (flagged honestly)
+
+- Broadcast/streaming info is not implemented — out of scope for this pass.
+- The derby list is a static, hand-maintained set of Big 5 rivalries — it
+  won't catch every possible flagged fixture, just the well-known ones.
+- Push notifications require Chrome on Android (or another browser with Web
+  Push support) — iOS Safari has its own install-first restrictions not
+  accounted for here, since the primary target is Android.
+- The scheduled push job (`scheduled-push.js`) defaults to firing at 13:00
+  UTC on Thursday and Friday (`0 13 * * 4,5`) — adjust the `config.schedule`
+  cron string in that file to match your timezone preference.

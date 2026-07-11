@@ -1,0 +1,15 @@
+{
+  "name": "soccer-dashboard-pwa",
+  "version": "1.0.0",
+  "description": "Personal installable PWA for Big 5 league scores, standings, weekend recaps, and match-of-the-week push notifications.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "netlify dev"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.70.0",
+    "@netlify/blobs": "^8.1.0",
+    "web-push": "^3.6.7"
+  }
+}
